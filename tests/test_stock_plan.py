@@ -35,6 +35,19 @@ def test_fit_count_too_small_usable():
     assert _fit_count(0, 0, 0) == 0
 
 
+def test_fit_count_decimal_exact_no_epsilon_roundup():
+    # 可用 299.99999995（300 − 2×0.000000025）：3 个 100mm 成品需 300，
+    # 差 5e-8 排不下，不能用容差误判为 3
+    assert _fit_count(299.99999995, 100, 0) == 2
+    # 恰好贴边（占用 == 可用长度）仍可排入
+    assert _fit_count(300, 100, 0) == 3
+    assert _fit_count(300.0, 100.0, 0.0) == 3
+    # 间隔同样按十进制核算：2 个 0.1 + 1 个 0.05 = 0.25 恰满；第 3 个需 0.4
+    assert _fit_count(0.25, 0.1, 0.05) == 2
+    assert _fit_count(0.3, 0.1, 0.05) == 2
+    assert _fit_count(0.24999999, 0.1, 0.05) == 1
+
+
 # ---------------------------------------------------------------------------
 # 单张出数与纸纹朝向
 # ---------------------------------------------------------------------------
@@ -76,6 +89,19 @@ def test_pieces_per_sheet_unusable_region():
 def test_pieces_per_sheet_invalid_grain():
     with pytest.raises(ValueError):
         _pieces_per_sheet(100, 100, "long", 50, 50, 0, 0)
+
+
+def test_pieces_per_sheet_tiny_margin_not_absorbed():
+    # 原纸宽 300、成品宽 100、四周留边 0.000000025、间隔 0：
+    # 可用宽 299.99999995，3 列需 300 -> 只能排 2 列（修复前容差误判 3 列）
+    pieces, columns, rows, usable_w, usable_h = _pieces_per_sheet(
+        300, 100, "height", 100, 50, 0.000000025, 0
+    )
+    assert (columns, rows, pieces) == (2, 1, 2)
+    assert usable_w == 299.99999995
+    assert usable_h == 99.99999995
+    # 留边为 0 时恰好贴边，仍排满 3 列
+    assert _pieces_per_sheet(300, 100, "height", 100, 50, 0, 0)[:3] == (6, 3, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +225,39 @@ def test_infeasible_message_states_capacity_and_demand():
         )
     message = str(exc_info.value)
     assert "30" in message and "100" in message
+
+
+def test_plan_stock_tiny_margin_capacity_and_feasibility():
+    # 任务场景：原纸 300×100、成品 100×50、留边 0.000000025、间隔 0
+    # 可用宽 299.99999995 -> 单张 2 列 × 1 行 = 2；需求 3（每册 1 张 × 印数 3）
+    # 库存 1 张产能 2 < 3 -> 不可行（修复前误判产能 3 而放行）
+    with pytest.raises(ValueError) as exc_info:
+        plan_stock(
+            4, 1, "left", 50, 50, 0, 3, [(300, 100, 1, "height")], 0.000000025, 0
+        )
+    message = str(exc_info.value)
+    assert "2" in message and "3" in message
+    # 库存 2 张 -> 产能 4 可行：用 2 张产 4，超产 1
+    result = plan_stock(
+        4, 1, "left", 50, 50, 0, 3, [(300, 100, 2, "height")], 0.000000025, 0
+    )
+    paper = result["papers"][0]
+    assert (paper["pieces_per_sheet"], paper["columns"], paper["rows"]) == (2, 2, 1)
+    assert paper["usable_width_mm"] == 299.99999995
+    assert paper["usable_height_mm"] == 99.99999995
+    assert paper["used"] == 2
+    assert result["total_production"] == 4
+    assert result["surplus"] == 1
+
+
+def test_plan_stock_decimal_sheet_width_exact_fit():
+    # 页宽 0.05、中缝 0.2 -> 成品宽十进制恰为 0.3（二进制浮点合成得
+    # 0.30000000000000004）；原纸 1×1、留边 0.35 -> 可用 0.3×0.3，恰好贴边排 1×1
+    result = plan_stock(
+        4, 1, "left", 0.05, 0.3, 0.2, 1, [(1, 1, 1, "height")], 0.35, 0
+    )
+    assert result["papers"][0]["pieces_per_sheet"] == 1
+    assert result["surplus"] == 0
 
 
 # ---------------------------------------------------------------------------

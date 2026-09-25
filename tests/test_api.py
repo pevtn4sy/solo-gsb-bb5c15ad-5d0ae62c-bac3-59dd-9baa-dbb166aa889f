@@ -2041,3 +2041,58 @@ def test_stock_plan_missing_field():
         {"width_mm": 300, "height_mm": 300, "grain": "height"}]}
     assert client.post("/api/v1/impose/stock-plan", json=body).status_code == 422
 
+
+def test_stock_plan_tiny_margin_columns_and_feasibility():
+    # 原纸宽 300、成品宽 100、四周留边 0.000000025、间隔 0：
+    # 可用宽 299.99999995，3 列需 300 -> 只能排 2 列；
+    # 库存 1 张产能 2 < 需求 3（每册 1 张 × 印数 3）-> 422
+    body = {
+        **STOCK_PLAN_BASE,
+        "page_width_mm": 50.0,
+        "page_height_mm": 50.0,
+        "copies": 3,
+        "papers": [
+            {"width_mm": 300, "height_mm": 100, "inventory": 1, "grain": "height"}
+        ],
+        "margin_mm": 0.000000025,
+        "spacing_mm": 0.0,
+    }
+    response = client.post("/api/v1/impose/stock-plan", json=body)
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "2" in message and "3" in message
+
+    # 库存 2 张 -> 产能 4 可行：单张 2 列 × 1 行，用 2 张产 4 超 1
+    body["papers"][0]["inventory"] = 2
+    response = client.post("/api/v1/impose/stock-plan", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    paper = data["papers"][0]
+    assert paper["pieces_per_sheet"] == 2
+    assert paper["columns"] == 2 and paper["rows"] == 1
+    assert paper["usable_width_mm"] == 299.99999995
+    assert paper["usable_height_mm"] == 99.99999995
+    assert paper["used"] == 2
+    assert data["total_production"] == 4
+    assert data["surplus"] == 1
+
+
+def test_stock_plan_exact_edge_fit_still_counts():
+    # 恰好贴边（留边 0、可用宽恰为 3 × 100）仍排满 3 列
+    body = {
+        **STOCK_PLAN_BASE,
+        "page_width_mm": 50.0,
+        "page_height_mm": 50.0,
+        "copies": 3,
+        "papers": [
+            {"width_mm": 300, "height_mm": 100, "inventory": 1, "grain": "height"}
+        ],
+        "margin_mm": 0.0,
+        "spacing_mm": 0.0,
+    }
+    response = client.post("/api/v1/impose/stock-plan", json=body)
+    assert response.status_code == 200
+    paper = response.json()["papers"][0]
+    assert paper["pieces_per_sheet"] == 6
+    assert paper["columns"] == 3 and paper["rows"] == 2
+

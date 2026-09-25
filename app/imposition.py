@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import bisect
 import math
-from typing import Collection, List, Literal, Optional, Tuple, TypeVar
+from decimal import Decimal, localcontext
+from typing import Collection, List, Literal, Optional, Tuple, TypeVar, Union
 
 Binding = Literal["left", "right"]
 
@@ -1433,22 +1434,61 @@ GrainDirection = Literal["width", "height"]
 # 单种原纸：(宽度 mm, 高度 mm, 库存张数, 纸纹方向)
 StockPaper = Tuple[int, int, int, GrainDirection]
 
-# 尺寸比较的浮点容差：仅抵消留边/间隔浮点运算的 ULP 级偏差，
-# 使“恰好排满整数行/列”不被误判为差一丝而少排一行/一列
-STOCK_FIT_EPS = 1e-9
+# 尺寸核算一律使用十进制（Decimal）：留边/间隔可能是 1e-8 量级的小数，
+# 二进制浮点加全局容差会把“差一丝排不下”误判为“恰好排满”（或反之），
+# 只有按十进制尺寸精确比较才能保证“n 个成品 + n−1 个间隔 ≤ 可用长度”
+# 这一判定不多排也不少排。
+
+# 十进制尺寸值：整数 / 浮点 / Decimal 均可
+DecimalSize = Union[int, float, Decimal]
 
 
-def _fit_count(usable: float, item: float, spacing: float) -> int:
-    """整行/整列排布数量：``n`` 个成品加 ``n-1`` 个间隔占 ``n*item + (n-1)*spacing``。
+def _to_decimal(value: DecimalSize) -> Decimal:
+    """把尺寸参数转换为十进制 ``Decimal``。
 
-    即 ``n ≤ (usable + spacing) / (item + spacing)``，向下取整；
-    可用长度小于单个成品时结果为 0（公式自身给出非正值，夹回 0）。
+    整数精确转换；浮点按 ``str()`` 的最短往返表示取值（即请求中的十进制
+    字面量，如 ``0.000000025`` → ``Decimal("2.5E-8")``），避免把二进制
+    浮点的表示误差带入尺寸核算。
     """
-    if usable < item - STOCK_FIT_EPS * max(1.0, abs(usable), item):
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    return Decimal(str(value))
+
+
+def _decimal_prec(*values: Decimal) -> int:
+    """按各操作数的最高有效位与最小小数位，估算精确十进制运算所需精度。
+
+    ``Decimal`` 的加减乘除在结果有效位数超出上下文精度时会舍入；取
+    ``最高有效位 − 最小小数位 + 10`` 可覆盖这些尺寸加减与整除的结果位数，
+    保证计算精确无舍入。
+    """
+    high = max(value.adjusted() for value in values)
+    low = min(value.as_tuple().exponent for value in values)
+    return max(28, high - low + 10)
+
+
+def _fit_count(usable: DecimalSize, item: DecimalSize, spacing: DecimalSize) -> int:
+    """整行/整列排布数量（按十进制尺寸精确核算）。
+
+    ``n`` 个成品加 ``n-1`` 个间隔的实际占用为 ``n*item + (n-1)*spacing``，
+    只有该占用不超过可用长度 ``usable`` 才计入 ``n``；恰好贴边（占用等于
+    可用长度）仍可排入。等价于 ``n ≤ (usable + spacing) / (item + spacing)``
+    的最大整数；可用长度小于单个成品、或成品尺寸非正时结果为 0。
+    """
+    usable_d = _to_decimal(usable)
+    item_d = _to_decimal(item)
+    spacing_d = _to_decimal(spacing)
+    if item_d <= 0 or usable_d < item_d:
         return 0
-    if item + spacing <= 0:
-        return 0
-    count = int(math.floor((usable + spacing) / (item + spacing) + STOCK_FIT_EPS))
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(usable_d, item_d, spacing_d)
+        step = item_d + spacing_d
+        total = usable_d + spacing_d
+        # n*item + (n-1)*spacing <= usable  ⇔  n <= total / step；
+        # 十进制整除 // 精确无舍入，恰好整除（贴边）时同样计入
+        count = int(total // step)
     return max(0, count)
 
 
@@ -1456,8 +1496,8 @@ def _pieces_per_sheet(
     stock_width_mm: int,
     stock_height_mm: int,
     grain: GrainDirection,
-    sheet_width_mm: float,
-    sheet_height_mm: float,
+    sheet_width_mm: DecimalSize,
+    sheet_height_mm: DecimalSize,
     margin_mm: float,
     spacing_mm: float,
 ) -> Tuple[int, int, int, float, float]:
@@ -1470,20 +1510,28 @@ def _pieces_per_sheet(
 
     扣除四周留边后的可用区域为
     ``(原纸宽 − 2 × 留边) × (原纸高 − 2 × 留边)``，成品之间留出统一裁切间隔，
-    行列均按整行整列排满。返回 ``(单张出数, 列数, 行数, 可用宽, 可用高)``。
+    行列均按整行整列排满；可用长度与每行/每列实际占用均按**十进制尺寸**
+    精确核算（``n`` 个成品加 ``n−1`` 个间隔不超过可用长度才计入 ``n``，
+    恰好贴边仍可排入）。返回 ``(单张出数, 列数, 行数, 可用宽, 可用高)``。
     """
     if grain not in ("width", "height"):
         raise ValueError(f"非法纸纹方向：{grain!r}，只支持 'width' / 'height'")
-    usable_w = stock_width_mm - 2 * margin_mm
-    usable_h = stock_height_mm - 2 * margin_mm
+    # 十进制可用区域：原纸整数毫米 − 2 × 留边，精确到留边的十进制位
+    stock_w_d = _to_decimal(stock_width_mm)
+    stock_h_d = _to_decimal(stock_height_mm)
+    margin_d = _to_decimal(margin_mm)
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(stock_w_d, stock_h_d, margin_d)
+        usable_w_d = stock_w_d - 2 * margin_d
+        usable_h_d = stock_h_d - 2 * margin_d
     if grain == "height":
-        columns = _fit_count(usable_w, sheet_width_mm, spacing_mm)
-        rows = _fit_count(usable_h, sheet_height_mm, spacing_mm)
+        columns = _fit_count(usable_w_d, sheet_width_mm, spacing_mm)
+        rows = _fit_count(usable_h_d, sheet_height_mm, spacing_mm)
     else:
         # 成品旋转 90° 落版（书脊与沿宽纸纹平行）：成品高沿原纸宽、成品宽沿原纸高
-        columns = _fit_count(usable_w, sheet_height_mm, spacing_mm)
-        rows = _fit_count(usable_h, sheet_width_mm, spacing_mm)
-    return columns * rows, columns, rows, usable_w, usable_h
+        columns = _fit_count(usable_w_d, sheet_height_mm, spacing_mm)
+        rows = _fit_count(usable_h_d, sheet_width_mm, spacing_mm)
+    return columns * rows, columns, rows, float(usable_w_d), float(usable_h_d)
 
 
 def _choose_stock_usage(
@@ -1611,7 +1659,9 @@ def plan_stock(
     每种原纸给整数毫米宽高、库存张数（0～30）与纸纹方向（``width`` 沿宽 /
     ``height`` 沿高）。成品只能按**书脊与纸纹平行**的唯一朝向，在扣除四周
     统一留边 ``margin_mm`` 的可用区域内、按统一裁切间隔 ``spacing_mm``
-    整行整列排满，得到该规格单张出数。
+    整行整列排满，得到该规格单张出数。出数按**十进制尺寸**精确核算：
+    某方向排 ``n`` 个成品的实际占用为 ``n × 成品尺寸 + (n−1) × 间隔``，
+    只有不超过扣边后的可用长度才计入 ``n``，恰好贴边仍可排入。
 
     在各规格库存张数内选择用量组合，使总产量满足总需求，并依次最小化：
     原纸总面积 → 超产张数（总产量 − 总需求）→ 按输入顺序的用量字典序。
@@ -1669,6 +1719,15 @@ def plan_stock(
 
     sheet_width = 2 * page_width_mm + gutter_mm
     sheet_height = page_height_mm
+    # 十进制成品尺寸：与响应回显的浮点值同源，但按十进制合成
+    # （避免 2 × 页宽 + 中缝 的二进制浮点组合误差进入出数核算）
+    page_width_d = _to_decimal(page_width_mm)
+    gutter_d = _to_decimal(gutter_mm)
+    page_height_d = _to_decimal(page_height_mm)
+    with localcontext() as ctx:
+        ctx.prec = _decimal_prec(page_width_d, gutter_d, page_height_d)
+        sheet_width_d = 2 * page_width_d + gutter_d
+        sheet_height_d = page_height_d
 
     pieces: List[int] = []
     areas: List[int] = []
@@ -1688,7 +1747,13 @@ def plan_stock(
                 f"第 {index} 种原纸的库存不能超过 {STOCK_INVENTORY_MAX} 张"
             )
         per_sheet, columns, rows, usable_w, usable_h = _pieces_per_sheet(
-            width, height, grain, sheet_width, sheet_height, margin_mm, spacing_mm
+            width,
+            height,
+            grain,
+            sheet_width_d,
+            sheet_height_d,
+            margin_mm,
+            spacing_mm,
         )
         pieces.append(per_sheet)
         areas.append(width * height)
