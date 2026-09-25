@@ -1950,6 +1950,56 @@ def test_stock_plan_infeasible_returns_422():
     assert "38" in message and "100" in message
 
 
+def test_stock_plan_tiny_margin_shortfall_returns_422():
+    # 缺陷场景：原纸宽 300、成品印张宽 100（2×页宽 50 + 中缝 0）、
+    # 四周留边 0.000000025 -> 可用宽 299.99999995、间隔 0。
+    # 按十进制核算只排得下 2 列（贴边才排 3），300×101 单张出 2；
+    # 仅 1 张库存（满负荷 2）无法满足需求 3 -> 422，而非误判为出 3 张
+    body = {
+        "total_pages": 4,
+        "max_sheets_per_signature": 1,
+        "binding": "left",
+        "page_width_mm": 50.0,
+        "page_height_mm": 100.0,
+        "gutter_mm": 0.0,
+        "copies": 3,
+        "papers": [
+            {"width_mm": 300, "height_mm": 101, "inventory": 1, "grain": "height"},
+        ],
+        "margin_mm": 0.000000025,
+        "spacing_mm": 0.0,
+    }
+    response = client.post("/api/v1/impose/stock-plan", json=body)
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "2" in message and "3" in message
+
+
+def test_stock_plan_exact_fit_no_margin_counts_three_columns():
+    # 无留边时可用宽恰好 300，贴边排 3 列：300×100 单张出 3，恰好满足需求 3
+    body = {
+        "total_pages": 4,
+        "max_sheets_per_signature": 1,
+        "binding": "left",
+        "page_width_mm": 50.0,
+        "page_height_mm": 100.0,
+        "gutter_mm": 0.0,
+        "copies": 3,
+        "papers": [
+            {"width_mm": 300, "height_mm": 100, "inventory": 1, "grain": "height"},
+        ],
+        "margin_mm": 0.0,
+        "spacing_mm": 0.0,
+    }
+    response = client.post("/api/v1/impose/stock-plan", json=body)
+    assert response.status_code == 200
+    paper = response.json()["papers"][0]
+    assert paper["pieces_per_sheet"] == 3
+    assert paper["columns"] == 3 and paper["rows"] == 1
+    assert paper["used"] == 1
+    assert response.json()["surplus"] == 0
+
+
 def test_stock_plan_all_zero_pieces_returns_422():
     body = {
         **STOCK_PLAN_BASE,

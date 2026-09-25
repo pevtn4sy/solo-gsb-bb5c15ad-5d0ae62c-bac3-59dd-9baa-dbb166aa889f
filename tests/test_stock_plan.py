@@ -1,6 +1,7 @@
 """原纸备料（stock-plan）算法单元测试。"""
 import itertools
 import random
+from decimal import Decimal
 
 import pytest
 
@@ -33,6 +34,66 @@ def test_fit_count_zero_spacing():
 def test_fit_count_too_small_usable():
     assert _fit_count(5, 10, 0) == 0
     assert _fit_count(0, 0, 0) == 0
+
+
+def test_fit_count_decimal_exact_fit_still_placed():
+    # 恰好贴边（占用 == 可用长度）仍可排入；按十进制精确核算
+    assert _fit_count(Decimal("300.00000000"), Decimal("100"), Decimal("0")) == 3
+    assert _fit_count(Decimal("209"), Decimal("100"), Decimal("9")) == 2  # 2*100+9
+    # 非零间隔下差一丝都不能多排一个
+    assert _fit_count(Decimal("208.9999999999"), Decimal("100"), Decimal("9")) == 1
+
+
+def test_fit_count_tiny_margin_shortfall_not_rounded_up():
+    # 缺陷场景：原纸宽 300、四周留边 0.000000025 -> 可用宽 299.99999995，
+    # 成品宽 100、间隔 0。旧实现的 1e-9 浮点容差把差 5e-8 的第 3 个误计入
+    usable = 300 - 2 * 0.000000025
+    assert usable == 299.99999995
+    assert _fit_count(usable, 100, 0) == 2
+    # 十进制字面量直传结论一致：差一丝不排、贴边排
+    assert _fit_count(Decimal("299.99999995"), Decimal("100"), Decimal("0")) == 2
+    assert _fit_count(Decimal("300"), Decimal("100"), Decimal("0")) == 3
+
+
+def test_pieces_per_sheet_tiny_margin_shortfall():
+    # 300×300、留边 0.000000025 -> 可用 299.99999995 × 同；成品 100×100、间隔 0：
+    # 行/列都只排 2 -> 单张出数 4（而非旧实现误判的 9）
+    pieces, columns, rows, usable_w, usable_h = _pieces_per_sheet(
+        300, 300, "height", 100, 100, 0.000000025, 0
+    )
+    assert (columns, rows) == (2, 2)
+    assert pieces == 4
+    assert usable_w == Decimal("299.99999995")
+    assert usable_h == Decimal("299.99999995")
+    # 无留边时 300 恰好排 3 个，贴边正常计入
+    assert _pieces_per_sheet(300, 300, "height", 100, 100, 0, 0)[:3] == (9, 3, 3)
+
+
+def test_plan_stock_tiny_margin_single_inventory_infeasible():
+    # 仅 1 张 300×101 原纸（库存 1）：宽 299.99999995 排 2 列、高 100.99999995
+    # 排 1 行 -> 单张出数 2；需求 3（4 页/册 × 印数 3）无法满足 -> ValueError（API 422）
+    with pytest.raises(ValueError, match="2"):
+        plan_stock(
+            4, 1, "left", 50, 100, 0, 3,
+            [(300, 101, 1, "height")],
+            0.000000025, 0,
+        )
+
+
+def test_plan_stock_tiny_margin_feasible_response_uses_decimal_fit():
+    # 库存 2 张时 2×2=4 满足需求 3：出数按十进制精确核算为 2，余量 1
+    result = plan_stock(
+        4, 1, "left", 50, 100, 0, 3,
+        [(300, 101, 2, "height")],
+        0.000000025, 0,
+    )
+    paper = result["papers"][0]
+    assert (paper["pieces_per_sheet"], paper["columns"], paper["rows"]) == (2, 2, 1)
+    assert paper["usable_width_mm"] == 299.99999995
+    assert paper["usable_height_mm"] == pytest.approx(100.99999995)
+    assert paper["used"] == 2
+    assert result["total_production"] == 4
+    assert result["surplus"] == 1
 
 
 # ---------------------------------------------------------------------------

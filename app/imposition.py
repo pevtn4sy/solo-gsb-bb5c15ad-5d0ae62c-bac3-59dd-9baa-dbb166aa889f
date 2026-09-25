@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import bisect
 import math
+from decimal import Decimal
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
@@ -1433,23 +1434,40 @@ GrainDirection = Literal["width", "height"]
 # 单种原纸：(宽度 mm, 高度 mm, 库存张数, 纸纹方向)
 StockPaper = Tuple[int, int, int, GrainDirection]
 
-# 尺寸比较的浮点容差：仅抵消留边/间隔浮点运算的 ULP 级偏差，
-# 使“恰好排满整数行/列”不被误判为差一丝而少排一行/一列
-STOCK_FIT_EPS = 1e-9
+
+def _decimal_mm(value: float | int | Decimal) -> Decimal:
+    """把毫米尺寸（int / float / Decimal）转为**按十进制字面量**精确表示的 Decimal。
+
+    JSON 请求中的十进制尺寸（如 ``0.000000025``）经 Python float 解析后，
+    ``str(float)`` 仍是往返精确的最短十进制串；直接按该字面量构造 Decimal，
+    即可按十进制核算占用，避免二进制浮点的 ULP 偏差在“差一丝排不下”时把
+    行列数向上多算（如 299.99999995 mm 被误判为排得下 3 个 100 mm 成品）。
+    int 与已是 Decimal 的值原样返回。
+    """
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
-def _fit_count(usable: float, item: float, spacing: float) -> int:
+def _fit_count(usable: float | int | Decimal, item: float | int | Decimal,
+               spacing: float | int | Decimal) -> int:
     """整行/整列排布数量：``n`` 个成品加 ``n-1`` 个间隔占 ``n*item + (n-1)*spacing``。
 
-    即 ``n ≤ (usable + spacing) / (item + spacing)``，向下取整；
-    可用长度小于单个成品时结果为 0（公式自身给出非正值，夹回 0）。
+    按十进制精确核算：仅当 ``n × 成品尺寸 + (n − 1) × 间隔 ≤ 可用长度``
+    时才计入 ``n``——**恰好贴边（等于）仍可排入**，差任意一丝都不行。
+    即 ``n = ⌊(可用长度 + 间隔) / (成品尺寸 + 间隔)⌋``（十进制精确运算）；
+    可用长度小于单个成品时结果为 0（防御性处理非正分母）。
     """
-    if usable < item - STOCK_FIT_EPS * max(1.0, abs(usable), item):
+    usable_d = _decimal_mm(usable)
+    item_d = _decimal_mm(item)
+    spacing_d = _decimal_mm(spacing)
+    if item_d <= 0 or usable_d < item_d:
         return 0
-    if item + spacing <= 0:
+    step = item_d + spacing_d
+    if step <= 0:
         return 0
-    count = int(math.floor((usable + spacing) / (item + spacing) + STOCK_FIT_EPS))
-    return max(0, count)
+    # 可用长度、成品尺寸、间隔均非负，商非负，整除即十进制精确向下取整
+    return int((usable_d + spacing_d) // step)
 
 
 def _pieces_per_sheet(
@@ -1460,7 +1478,7 @@ def _pieces_per_sheet(
     sheet_height_mm: float,
     margin_mm: float,
     spacing_mm: float,
-) -> Tuple[int, int, int, float, float]:
+) -> Tuple[int, int, int, Decimal, Decimal]:
     """计算单张原纸在唯一合法朝向下的整行整列出数。
 
     成品书脊沿页高，只能按**书脊与纸纹平行**落版（不允许旋转调换朝向）：
@@ -1470,19 +1488,25 @@ def _pieces_per_sheet(
 
     扣除四周留边后的可用区域为
     ``(原纸宽 − 2 × 留边) × (原纸高 − 2 × 留边)``，成品之间留出统一裁切间隔，
-    行列均按整行整列排满。返回 ``(单张出数, 列数, 行数, 可用宽, 可用高)``。
+    行列均按整行整列排满。占用长度按**十进制精确核算**（见 :func:`_fit_count`）：
+    恰好贴边仍排入，差一丝也不多算。
+    返回 ``(单张出数, 列数, 行数, 可用宽, 可用高)``，可用宽/高为 Decimal。
     """
     if grain not in ("width", "height"):
         raise ValueError(f"非法纸纹方向：{grain!r}，只支持 'width' / 'height'")
-    usable_w = stock_width_mm - 2 * margin_mm
-    usable_h = stock_height_mm - 2 * margin_mm
+    margin = _decimal_mm(margin_mm)
+    spacing = _decimal_mm(spacing_mm)
+    sheet_w = _decimal_mm(sheet_width_mm)
+    sheet_h = _decimal_mm(sheet_height_mm)
+    usable_w = Decimal(stock_width_mm) - 2 * margin
+    usable_h = Decimal(stock_height_mm) - 2 * margin
     if grain == "height":
-        columns = _fit_count(usable_w, sheet_width_mm, spacing_mm)
-        rows = _fit_count(usable_h, sheet_height_mm, spacing_mm)
+        columns = _fit_count(usable_w, sheet_w, spacing)
+        rows = _fit_count(usable_h, sheet_h, spacing)
     else:
         # 成品旋转 90° 落版（书脊与沿宽纸纹平行）：成品高沿原纸宽、成品宽沿原纸高
-        columns = _fit_count(usable_w, sheet_height_mm, spacing_mm)
-        rows = _fit_count(usable_h, sheet_width_mm, spacing_mm)
+        columns = _fit_count(usable_w, sheet_h, spacing)
+        rows = _fit_count(usable_h, sheet_w, spacing)
     return columns * rows, columns, rows, usable_w, usable_h
 
 
@@ -1611,7 +1635,9 @@ def plan_stock(
     每种原纸给整数毫米宽高、库存张数（0～30）与纸纹方向（``width`` 沿宽 /
     ``height`` 沿高）。成品只能按**书脊与纸纹平行**的唯一朝向，在扣除四周
     统一留边 ``margin_mm`` 的可用区域内、按统一裁切间隔 ``spacing_mm``
-    整行整列排满，得到该规格单张出数。
+    整行整列排满，得到该规格单张出数。每行/列的实际占用按**十进制精确核算**：
+    仅当 ``n × 成品尺寸 + (n − 1) × 间隔 ≤ 扣边后可用长度`` 才计入 ``n``，
+    恰好贴边仍可排入，差一丝也不多算（避免二进制浮点误差把差一丝的第 n 个计入）。
 
     在各规格库存张数内选择用量组合，使总产量满足总需求，并依次最小化：
     原纸总面积 → 超产张数（总产量 − 总需求）→ 按输入顺序的用量字典序。
@@ -1667,8 +1693,12 @@ def plan_stock(
     sheets_per_copy = sum(signature["sheet_count"] for signature in signatures)
     demand = sheets_per_copy * copies
 
+    # 成品尺寸：响应回显沿用 float（与机台版面一致）；排布核算使用按十进制
+    # 字面量精确表示的 Decimal，避免二进制浮点在贴边/差一丝时误判行列数
     sheet_width = 2 * page_width_mm + gutter_mm
     sheet_height = page_height_mm
+    sheet_width_decimal = 2 * _decimal_mm(page_width_mm) + _decimal_mm(gutter_mm)
+    sheet_height_decimal = _decimal_mm(page_height_mm)
 
     pieces: List[int] = []
     areas: List[int] = []
@@ -1688,7 +1718,13 @@ def plan_stock(
                 f"第 {index} 种原纸的库存不能超过 {STOCK_INVENTORY_MAX} 张"
             )
         per_sheet, columns, rows, usable_w, usable_h = _pieces_per_sheet(
-            width, height, grain, sheet_width, sheet_height, margin_mm, spacing_mm
+            width,
+            height,
+            grain,
+            sheet_width_decimal,
+            sheet_height_decimal,
+            margin_mm,
+            spacing_mm,
         )
         pieces.append(per_sheet)
         areas.append(width * height)
@@ -1703,8 +1739,8 @@ def plan_stock(
                 "pieces_per_sheet": per_sheet,
                 "columns": columns,
                 "rows": rows,
-                "usable_width_mm": usable_w,
-                "usable_height_mm": usable_h,
+                "usable_width_mm": float(usable_w),
+                "usable_height_mm": float(usable_h),
                 "used": 0,
                 "production": 0,
                 "area_mm2": 0,
